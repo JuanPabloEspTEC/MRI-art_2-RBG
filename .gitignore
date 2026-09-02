@@ -1,0 +1,35 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.Python
+
+# ---- Entornos virtuales / UV ----
+.venv/
+venv/
+env/
+.uv/
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+
+# ---- Datos generados ----
+data/processed/
+data/interim/
+*.parquet
+
+# ---- Herramientas ----
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+
+# ---- Sistema operativo ----
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ---- Editores ----
+.vscode/
+.idea/
+*~
