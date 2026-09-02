@@ -23,3 +23,12 @@ mri-art2-rbg = "mri_art2_rbg:main"
 [build-system]
 requires = ["uv_build>=0.12.8,<0.13.0"]
 build-backend = "uv_build"
+
+[tool.uv]
+link-mode = "copy"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+    "jupyter>=1.1.1",
+]
