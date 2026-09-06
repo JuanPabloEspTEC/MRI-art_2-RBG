@@ -1,5 +1,5 @@
 ---
-title: "DAGs propuestas por expertos del área médica"
+title: "DAGs propuestas por especialistas"
 author: "Juan Pablo Venegas Padilla"
 format:
     html:
@@ -11,703 +11,195 @@ format:
 editor: visual
 ---
 
-## Por qué una DAG antes del modelo
+## Entrevistas
 
-Una Red Bayesiana necesita **dos ingredientes**: la *estructura* (qué variable depende de cuál) y los *parámetros* (qué tan fuerte es cada dependencia). Los notebooks anteriores prepararon los datos para estimar los parámetros; este documento define la **estructura**.
+Se visitó la Escuela de Medicina del campus y se entrevistó a tres personas que conocen sobre la Enfermedad Renal Crónica (ERC). Cada una propuso una estructura de dependencias entre las variables del dataset y dos consultas que le interesaría resolver con el modelo.
 
-Existen dos caminos para obtenerla:
-
-| Camino | Cómo se obtiene | Riesgo |
-|-----------------|--------------------------|-----------------------------|
-| **Aprendizaje estructural** | Un algoritmo la infiere de los datos (`hc`, `pc.stable`, `tabu`) | Con 400 filas y correlaciones altas entre `hemo`--`pcv`--`rc`, el algoritmo puede orientar arcos al revés de lo que es fisiológicamente posible |
-| **Elicitación de expertos** | Un clínico dicta el orden causal | Depende del experto, pero **garantiza que ningún arco contradiga la fisiología** |
-
-Este documento toma el segundo camino. Las DAGs aquí propuestas servirán después como:
-
-1.  **Estructura fija** para ajustar la Red Bayesiana Gaussiana con `bn.fit()`.
-2.  **Restricciones** (`whitelist` / `blacklist`) para el aprendizaje estructural.
-3.  **Referencia** contra la cual comparar la estructura que el algoritmo aprenda solo.
-
-### Convención de dirección
-
-Un arco `X → Y` se lee **"X ocurre antes y modifica a Y"**, nunca "X correlaciona con Y". Esto obliga a respetar tres reglas:
-
--   **Temporalidad:** `age` no puede tener padres; nada causa la edad del paciente.
--   **Enfermedad → signo:** el daño renal causa la alteración del laboratorio, no al revés. La creatinina sube *porque* el filtrado cayó.
--   **Aciclicidad:** aunque la fisiología real tenga ciclos de retroalimentación, un DAG no los admite. Cuando aparezca uno, se documenta y se rompe explícitamente.
+| Persona entrevistada                  | Estructura |
+|---------------------------------------|------------|
+| Estudiante de 5º semestre de Medicina | DAG 1      |
+| Estudiante de 9º semestre de Medicina | DAG 2      |
+| Estudiante de 9º semestre de Medicina | DAG 3      |
 
 ```{r}
-#| message: false
-#| warning: false
-
 library(bnlearn)
-library(Rgraphviz)
-library(tidyverse)
-library(jsonlite)
 ```
 
-`Rgraphviz` arrastra los paquetes `graph` y `BiocGenerics`, que enmascaran `nodes()` y `score()` de `bnlearn`. Por eso esas dos funciones se llaman con el prefijo `bnlearn::` a lo largo del documento.
-
-## 1. Datos y variables disponibles
-
-Las DAGs solo pueden contener variables que existan en el dataset. Se localiza la raíz del proyecto y se cargan tanto el archivo crudo (25 variables, incluye el diagnóstico) como el imputado del notebook anterior (13 variables continuas).
-
 ```{r}
-#| message: false
-
-# Sube directorios hasta encontrar la raíz del proyecto, para que el documento
-#   funcione igual si se renderiza desde 'notebook/' o desde la raíz.
-RAIZ <- normalizePath(".")
-while (!file.exists(file.path(RAIZ, "pyproject.toml")) && dirname(RAIZ) != RAIZ) {
-  RAIZ <- dirname(RAIZ)
-}
-cat("Raíz del proyecto:", RAIZ, "\n")
-
-# Dataset crudo: las 25 variables, incluido el diagnóstico
-crudo <- read_csv(file.path(RAIZ, "data", "raw", "ckd.csv"),
-                  show_col_types = FALSE) |>
-  select(-id)
-
-# Dataset imputado: solo las 13 continuas que entran a la Red Gaussiana
-imputado <- read_csv(file.path(RAIZ, "notebook", "data", "processed", "ckd_imputado.csv"),
-                     show_col_types = FALSE)
-
-cat("Crudo:   ", nrow(crudo), "filas x", ncol(crudo), "variables\n")
-cat("Imputado:", nrow(imputado), "filas x", ncol(imputado), "variables\n")
-cat("Faltantes en el imputado:", sum(is.na(imputado)), "\n\n")
-cat("Variables continuas para la Red Gaussiana:\n")
-print(names(imputado))
+data = read.csv("./data/processed/ckd_imputado.csv")
+head(data)
 ```
 
-Cada variable, qué mide y qué papel juega en la fisiopatología de la Enfermedad Renal Crónica (ERC). La columna `grupo` se usa después para colorear los nodos.
+Se trabaja con las 13 variables continuas que salieron del notebook de imputación. El diagnóstico (`classification`) no entra a las estructuras porque una red gaussiana solo admite variables continuas; en el siguiente notebook se discute cómo incorporarlo.
+
+| Variable | Significado       |
+|----------|-------------------|
+| `age`    | Edad              |
+| `bp`     | Presión arterial  |
+| `sg`     | Densidad urinaria |
+| `al`     | Albúmina en orina |
+| `bgr`    | Glucosa en sangre |
+| `bu`     | Urea en sangre    |
+| `sc`     | Creatinina sérica |
+| `sod`    | Sodio sérico      |
+| `pot`    | Potasio sérico    |
+| `hemo`   | Hemoglobina       |
+| `pcv`    | Hematocrito       |
+| `wc`     | Leucocitos        |
+| `rc`     | Eritrocitos       |
 
 ```{r}
-diccionario <- tribble(
-  ~variable,        ~significado,                  ~grupo,          ~papel_en_la_ERC,
-  "age",            "Edad",                        "Demográfico",   "Factor de riesgo no modificable; el filtrado glomerular cae ~1 mL/min por año tras los 40",
-  "bp",             "Presión arterial",            "Hemodinámico",  "La hipertensión daña el glomérulo y es a la vez consecuencia de la retención de sodio",
-  "bgr",            "Glucosa en sangre",           "Metabólico",    "La hiperglucemia sostenida produce nefropatía diabética, primera causa de ERC",
-  "sg",             "Densidad urinaria",           "Función renal", "Capacidad de concentrar orina; cae cuando el túbulo se daña (isostenuria)",
-  "al",             "Albúmina en orina",           "Función renal", "Marca la ruptura de la barrera glomerular: la proteína pasa a la orina y baja en sangre",
-  "su",             "Glucosa en orina",            "Metabólico",    "Aparece cuando la glucemia supera el umbral renal de reabsorción",
-  "bu",             "Urea en sangre",              "Función renal", "Producto nitrogenado que se acumula al perderse el filtrado",
-  "sc",             "Creatinina sérica",           "Función renal", "Mejor marcador indirecto del filtrado glomerular; sube cuando la depuración cae",
-  "sod",            "Sodio sérico",                "Electrolitos",  "Se altera por la incapacidad renal de manejar agua y sal",
-  "pot",            "Potasio sérico",              "Electrolitos",  "Se acumula en sangre al caer la excreción renal (hiperkalemia)",
-  "hemo",           "Hemoglobina",                 "Hematológico",  "Baja por déficit de eritropoyetina, hormona que produce el riñón",
-  "pcv",            "Hematocrito",                 "Hematológico",  "Volumen de glóbulos rojos; cae junto con la hemoglobina",
-  "rc",             "Conteo de eritrocitos",       "Hematológico",  "Número de glóbulos rojos; misma causa que la anemia renal",
-  "wc",             "Conteo de leucocitos",        "Inflamación",   "Sube por la inflamación crónica y las infecciones asociadas al daño renal",
-  "rbc",            "Eritrocitos en orina",        "Urinario",      "Hematuria: sangre en orina por lesión glomerular",
-  "pc",             "Células de pus en orina",     "Urinario",      "Leucocitos en orina, indicador de infección urinaria",
-  "pcc",            "Cúmulos de células de pus",   "Urinario",      "Agregados de leucocitos, infección más establecida",
-  "ba",             "Bacterias en orina",          "Urinario",      "Causa directa de la infección del tracto urinario",
-  "htn",            "Hipertensión (dx)",           "Comorbilidad",  "Diagnóstico previo de hipertensión arterial crónica",
-  "dm",             "Diabetes mellitus (dx)",      "Comorbilidad",  "Diagnóstico previo de diabetes",
-  "cad",            "Enfermedad coronaria",        "Comorbilidad",  "Comparte factores de riesgo con la ERC (edad, HTA, diabetes)",
-  "appet",          "Apetito",                     "Síntoma",       "La anorexia es un síntoma del síndrome urémico",
-  "pe",             "Edema en pies",               "Síntoma",       "Retención de líquido por pérdida de albúmina y de sodio",
-  "ane",            "Anemia (dx)",                 "Hematológico",  "Etiqueta clínica derivada de la hemoglobina baja",
-  "classification", "Diagnóstico de ERC",          "Diagnóstico",   "Variable objetivo: ckd / notckd"
+nodos = names(data)
+nodos
+```
+
+## DAG 1
+
+Propuesta del estudiante de 5º semestre. Describe la ERC como una cascada: la edad y la glucosa inician el daño, la presión arterial arranca la fisiopatología, y de ahí el deterioro avanza etapa por etapa hasta la anemia y la inflamación.
+
+$$\texttt{age};\texttt{bgr} \rightarrow \texttt{bp} \rightarrow \texttt{al};\texttt{sg} \rightarrow \texttt{bu};\texttt{sc} \rightarrow \texttt{sod};\texttt{pot} \rightarrow \texttt{rc};\texttt{hemo} \rightarrow \texttt{pcv} \rightarrow \texttt{wc}$$
+
+```{r}
+dag1 = empty.graph(nodes = nodos)
+
+arc_set1 = matrix(c("age","bp",
+                    "bgr","al", "bgr","sg",
+                    "bp","al", "bp","sg",
+                    "al","bu", "al","sc", "sg","bu", "sg","sc",
+                    "bu","sod", "bu","pot", "sc","sod", "sc","pot",
+                    "sod","rc", "sod","hemo", "pot","rc", "pot","hemo",
+                    "rc","pcv", "hemo","pcv",
+                    "pcv","wc"),
+                  byrow = TRUE, ncol = 2, dimnames = list(NULL, c("from", "to")))
+
+arcs(dag1) = arc_set1
+dag1
+```
+
+```{r}
+#| fig-width: 11
+#| fig-height: 5
+
+graphviz.plot(dag1, shape = "ellipse")
+```
+
+El estudiante también señaló que la acumulación de sodio y potasio vuelve a subir la presión arterial. Esa flecha cierra un ciclo y `bnlearn` no la acepta:
+
+```{r}
+ciclico = empty.graph(nodes = nodos)
+tryCatch(arcs(ciclico) <- rbind(arc_set1, c("sod", "bp"), c("pot", "bp")),
+         error = function(e) conditionMessage(e))
+```
+
+Se omite esa retroalimentación y la cascada continúa hacia la anemia.
+
+Consultas propuestas:
+
+1.  ¿Qué tan probable es que un paciente con presión arterial elevada tenga la creatinina alta?
+2.  Si un paciente llega con hemoglobina baja, ¿qué hematocrito se espera?
+
+## DAG 2
+
+Propuesta del primer estudiante de 9º semestre. Mantiene la forma de cascada, pero separa la edad como origen de las dos causas principales de ERC, y hace colgar la anemia directamente de los marcadores de filtrado (`sc` y `bu`) en lugar de los electrolitos, porque la eritropoyetina la produce el riñón dañado.
+
+```{r}
+dag2 = empty.graph(nodes = nodos)
+
+arc_set2 = matrix(c("age","bp", "age","bgr",
+                    "bp","al", "bp","sg", "bgr","al", "bgr","sg",
+                    "al","sc", "al","bu", "sg","sc", "sg","bu",
+                    "sc","sod", "sc","pot", "sc","hemo",
+                    "bu","sod", "bu","pot", "bu","hemo",
+                    "hemo","pcv", "hemo","rc",
+                    "sc","wc"),
+                  byrow = TRUE, ncol = 2, dimnames = list(NULL, c("from", "to")))
+
+arcs(dag2) = arc_set2
+dag2
+```
+
+```{r}
+#| fig-width: 11
+#| fig-height: 5
+
+graphviz.plot(dag2, shape = "ellipse")
+```
+
+Consultas propuestas:
+
+3.  En un paciente con daño renal avanzado, ¿cuánta hemoglobina se espera?
+4.  ¿Qué tan probable es la hiperkalemia en un paciente con urea elevada?
+
+## DAG 3
+
+Propuesta del segundo estudiante de 9º semestre. Separa las dos vías de daño: la diabetes actúa sobre el glomérulo produciendo albuminuria, y la hipertensión sobre el túbulo produciendo pérdida de concentración urinaria. Las dos vías convergen en los marcadores de filtrado. Añade además el descenso del filtrado por edad.
+
+```{r}
+dag3 = empty.graph(nodes = nodos)
+
+arc_set3 = matrix(c("age","bp", "age","bgr", "age","sc",
+                    "bgr","al", "bp","sg",
+                    "al","sc", "al","bu", "sg","sc", "sg","bu",
+                    "sc","sod", "sc","pot", "sc","hemo",
+                    "bu","sod", "bu","pot",
+                    "hemo","pcv", "hemo","rc",
+                    "sc","wc"),
+                  byrow = TRUE, ncol = 2, dimnames = list(NULL, c("from", "to")))
+
+arcs(dag3) = arc_set3
+dag3
+```
+
+```{r}
+#| fig-width: 11
+#| fig-height: 5
+
+graphviz.plot(dag3, shape = "ellipse")
+```
+
+Consultas propuestas:
+
+5.  ¿Cómo cambia la albuminuria esperada entre un paciente con glucosa normal y uno con hiperglucemia?
+6.  ¿Qué tan probable es que un paciente diabético tenga la creatinina alta?
+
+## Comparación de las estructuras
+
+```{r}
+comparacion = data.frame(
+  DAG = c("DAG 1", "DAG 2", "DAG 3"),
+  arcos = c(narcs(dag1), narcs(dag2), narcs(dag3)),
+  aciclica = c(acyclic(dag1), acyclic(dag2), acyclic(dag3))
 )
-
-diccionario
-```
-
-## 2. Herramientas de construcción y graficado
-
-Tres utilidades que se reutilizan en todas las propuestas:
-
--   `arcos_en_cascada()`: conecta cada variable de una etapa con todas las de la siguiente, que es como el experto describió la progresión de la enfermedad.
--   `construir_dag()`: arma el objeto `bn` de `bnlearn`. La asignación `arcs(dag) <- ...` **valida la aciclicidad automáticamente**: si la estructura tiene un ciclo, `bnlearn` lanza un error.
--   `graficar_dag()`: dibuja el grafo con el motor `dot` de Graphviz, coloreando cada nodo por su grupo clínico. Recibe los arcos como data frame (no como objeto `bn`) para poder dibujar también los arcos que se tuvieron que omitir.
-
-```{r}
-PALETA <- c("Demográfico"   = "#b0bec5", "Comorbilidad" = "#ce93d8",
-            "Metabólico"    = "#ffcc80", "Hemodinámico" = "#ef9a9a",
-            "Función renal" = "#90caf9", "Electrolitos" = "#80cbc4",
-            "Hematológico"  = "#f48fb1", "Inflamación"  = "#fff59d",
-            "Urinario"      = "#c5e1a5", "Síntoma"      = "#bcaaa4",
-            "Diagnóstico"   = "#455a64")
-
-# Vector nombrado variable -> grupo clínico, tomado del diccionario
-GRUPO <- setNames(diccionario$grupo, diccionario$variable)
-
-
-arcos_en_cascada <- function(etapas) {
-  # Cada variable de una etapa apunta a todas las de la etapa siguiente
-  purrr::map_dfr(seq_len(length(etapas) - 1), function(k) {
-    expand.grid(from = etapas[[k]], to = etapas[[k + 1]],
-                stringsAsFactors = FALSE)
-  })
-}
-
-
-construir_dag <- function(arcos, nombre = "DAG") {
-  nodos <- unique(c(arcos$from, arcos$to))
-  dag <- empty.graph(nodes = nodos)
-  arcs(dag) <- as.matrix(arcos[, c("from", "to")])   # falla si hay ciclo
-
-  cat(sprintf("%s: %d nodos, %d arcos — acíclica: %s\n",
-              nombre, length(bnlearn::nodes(dag)), narcs(dag), acyclic(dag)))
-  dag
-}
-
-
-graficar_dag <- function(arcos, titulo, arcos_rojos = NULL, arcos_verdes = NULL,
-                         rankdir = "LR", cex_nodo = 0.8) {
-  nodos <- unique(c(arcos$from, arcos$to))
-
-  g <- new("graphNEL", nodes = nodos, edgemode = "directed")
-  for (i in seq_len(nrow(arcos))) {
-    g <- graph::addEdge(arcos$from[i], arcos$to[i], g)
-  }
-
-  gr <- Rgraphviz::layoutGraph(
-    g, attrs = list(graph = list(rankdir = rankdir),
-                    node  = list(fixedsize = FALSE, shape = "ellipse")))
-
-  grupos <- GRUPO[nodos]
-  graph::nodeRenderInfo(gr) <- list(
-    fill    = setNames(unname(PALETA[grupos]), nodos),
-    textCol = setNames(ifelse(grupos == "Diagnóstico", "white", "black"), nodos),
-    lwd     = 1.2,
-    cex     = cex_nodo)
-
-  # Color por arco: gris por defecto, rojo punteado para los omitidos,
-  #   verde para los que dos propuestas comparten.
-  nombres <- paste(arcos$from, arcos$to, sep = "~")
-  col <- setNames(rep("#546e7a", length(nombres)), nombres)
-  lty <- setNames(rep("solid",   length(nombres)), nombres)
-  lwd <- setNames(rep(1.5,       length(nombres)), nombres)
-
-  if (!is.null(arcos_rojos)) {
-    r <- paste(arcos_rojos$from, arcos_rojos$to, sep = "~")
-    col[r] <- "#c62828"; lty[r] <- "dashed"; lwd[r] <- 2
-  }
-  if (!is.null(arcos_verdes)) {
-    v <- paste(arcos_verdes$from, arcos_verdes$to, sep = "~")
-    col[v] <- "#2e7d32"; lwd[v] <- 2.6
-  }
-
-  graph::edgeRenderInfo(gr) <- list(col = col, lty = lty, lwd = lwd)
-
-  Rgraphviz::renderGraph(gr)
-  title(main = titulo, cex.main = 1.05, font.main = 2)
-  invisible(gr)
-}
-
-
-resumen_dag <- function(dag, nombre) {
-  a <- arcs(dag)
-  n <- length(bnlearn::nodes(dag))
-  grados_entrada <- sapply(bnlearn::nodes(dag), function(v) length(parents(dag, v)))
-  tibble(
-    DAG               = nombre,
-    nodos             = n,
-    arcos             = nrow(a),
-    densidad          = round(nrow(a) / (n * (n - 1) / 2), 3),
-    raices            = sum(grados_entrada == 0),
-    hojas             = sum(sapply(bnlearn::nodes(dag), function(v) length(children(dag, v))) == 0),
-    grado_entrada_max = max(grados_entrada),
-    parametros        = nrow(a) + 2 * n   # 1 coeficiente por arco + media y varianza por nodo
-  )
-}
-```
-
-## 3. DAG 1 --- Cascada fisiopatológica del experto
-
-Estructura dictada por el experto clínico. Describe la ERC como una **cascada secuencial**: cada etapa del daño renal produce la siguiente, y el diagnóstico aparece al final como consecuencia acumulada de todo el proceso.
-
-| Etapa | Variables | Mecanismo dictado por el experto |
-|--------|-----------------|-----------------------------------------------|
-| 1 | `age`, `bgr` | **Factores de riesgo.** La edad es el factor no modificable que inicia el deterioro. La hiperglucemia entra por vía propia: la nefropatía diabética daña el glomérulo sin pasar por la presión arterial. |
-| 2 | `bp` | **Arranca la fisiopatología.** El aumento de presión arterial es el primer evento hemodinámico que somete al glomérulo a estrés. |
-| 3 | `al`, `sg` | **Daño de la barrera glomerular y tubular.** La albúmina se fuga: ↑ en orina, ↓ en sangre. La densidad urinaria ↓ porque el riñón pierde la capacidad de concentrar. Primeros biomarcadores de caída del filtrado. |
-| 4 | `bu`, `sc` | **Caída del filtrado confirmada.** Urea y creatinina ↑ en sangre porque dejan de depurarse. Biomarcadores duros de pérdida de función renal. |
-| 5 | `sod`, `pot` | **Desequilibrio electrolítico.** Sodio y potasio ↑ en sangre por la menor excreción renal. |
-| 6 | `rc`, `hemo` | **Anemia renal.** El riñón dañado produce menos eritropoyetina, la hormona que estimula la médula ósea: caen los eritrocitos y la hemoglobina. |
-| 7 | `pcv` | **Hematocrito ↓**, arrastrado por la caída de la producción de hemoglobina. |
-| 8 | `wc` | **Leucocitos ↑** por la lesión renal y la inflamación crónica que la acompaña. |
-| 9 | `classification` | **Diagnóstico de ERC**, resultado final de toda la cascada. |
-
-Dentro de cada etapa las variables son manifestaciones simultáneas del mismo mecanismo, por lo que **cada variable de una etapa apunta a todas las de la siguiente**.
-
-```{r}
-CASCADA_EXPERTO <- list(
-  "age",                    # 1. Factor de riesgo no modificable
-  "bp",                     # 2. Inicia la fisiopatología
-  c("al", "sg"),            # 3. Daño glomerular y tubular
-  c("bu", "sc"),            # 4. Caída confirmada del filtrado
-  c("sod", "pot"),          # 5. Desequilibrio electrolítico
-  c("rc", "hemo"),          # 6. Anemia por déficit de eritropoyetina
-  "pcv",                    # 7. Hematocrito arrastrado por la hemoglobina
-  "wc",                     # 8. Inflamación por lesión renal
-  "classification"          # 9. Diagnóstico de ERC
-)
-
-arcos_dag1 <- arcos_en_cascada(CASCADA_EXPERTO)
-
-# La glucemia entra por vía independiente de la presión: la nefropatía
-#   diabética daña directamente el glomérulo (al) y el túbulo (sg).
-arcos_dag1 <- rbind(arcos_dag1,
-                    data.frame(from = c("bgr", "bgr"), to = c("al", "sg")))
-
-DAG_1 <- construir_dag(arcos_dag1, "DAG 1 (cascada del experto)")
-```
-
-### La retroalimentación que hubo que omitir
-
-El experto también señaló que la acumulación de electrolitos (`sod`, `pot`) **vuelve a elevar la presión arterial**. Fisiológicamente es correcto: la retención de sodio expande el volumen circulante y sube la presión. Pero esa flecha cierra el ciclo
-
-$$\texttt{bp} \rightarrow \texttt{al};\texttt{sg} \rightarrow \texttt{bu};\texttt{sc} \rightarrow \texttt{sod};\texttt{pot} \rightarrow \texttt{bp}$$
-
-y sin aciclicidad no existe la factorización de la distribución conjunta sobre la que se construye una Red Bayesiana. `bnlearn` lo rechaza de plano:
-
-```{r}
-RETROALIMENTACION <- data.frame(from = c("sod", "pot"), to = c("bp", "bp"))
-
-resultado <- tryCatch({
-  dag_ciclico <- empty.graph(nodes = bnlearn::nodes(DAG_1))
-  arcs(dag_ciclico) <- as.matrix(rbind(arcos_dag1, RETROALIMENTACION))
-  "bnlearn ACEPTÓ la estructura (no debería)"
-}, error = function(e) paste("bnlearn la rechazó:", conditionMessage(e)))
-
-cat(resultado, "\n")
-```
-
-Por acuerdo con el experto se **omiten los arcos** `sod → bp` y `pot → bp`, y la cadena continúa de `sod`;`pot` hacia la anemia renal. En la gráfica se dibujan punteados en rojo para dejar constancia del mecanismo que el modelo no captura.
-
-```{r}
-#| fig-width: 13
-#| fig-height: 6
-
-graficar_dag(rbind(arcos_dag1, RETROALIMENTACION),
-             "DAG 1 - Cascada fisiopatológica de la ERC (propuesta del experto)",
-             arcos_rojos = RETROALIMENTACION)
-```
-
-```{r}
-# Toda variable de la DAG debe existir en el dataset
-cat("Nodos de la DAG 1:", length(bnlearn::nodes(DAG_1)), "\n")
-cat("Ausentes en el crudo:   ",
-    paste(setdiff(bnlearn::nodes(DAG_1), names(crudo)), collapse = ", "), "(ninguno)\n")
-cat("Ausentes en el imputado:",
-    paste(setdiff(bnlearn::nodes(DAG_1), names(imputado)), collapse = ", "), "\n")
-cat("Continuas del imputado que la DAG 1 no usa:",
-    paste(setdiff(names(imputado), bnlearn::nodes(DAG_1)), collapse = ", "), "(ninguna)\n")
-```
-
-**Observaciones de la DAG 1:**
-
--   La estructura es una **cascada casi lineal**: 9 etapas para 14 variables. Es la traducción directa de "una cosa lleva a la otra" del razonamiento clínico.
-
--   `bgr` es la única variable que entra fuera de la cadena principal, reflejando que la nefropatía diabética tiene **una vía de daño independiente de la presión arterial**.
-
--   `classification` queda como **hoja al final de la cascada**. Esto invierte la convención diagnóstica habitual (enfermedad → signo) y la sustituye por una lectura acumulativa: la ERC no es lo que causa los hallazgos, es la etiqueta que se asigna cuando toda la cascada ya ocurrió. Es defendible, pero tiene una consecuencia práctica: al usar la red para **predecir** el diagnóstico, toda la evidencia entra por un único padre (`wc`).
-
--   La cadena `sod`;`pot` → `rc`;`hemo` **hereda la posición** que esas variables ocupaban en la cascada original: al omitir el retorno hacia `bp`, los electrolitos quedan como padres de la anemia. Clínicamente el vínculo real no es electrolito → anemia, sino que ambos comparten la misma causa (la caída del filtrado). Es la principal deuda estructural que deja la omisión del ciclo, y motiva las propuestas siguientes.
-
-## 4. DAG 2 --- Modelo fisiopatológico ampliado (25 variables)
-
-La DAG 1 usa 14 de las 25 variables y coloca el diagnóstico como hoja. Esta segunda propuesta explora la **convención diagnóstica clásica en medicina**: la enfermedad es la causa latente y los hallazgos de laboratorio son sus manifestaciones. La flecha va `enfermedad → signo`, porque la creatinina sube *porque* el riñón falla.
-
-Incorpora además las comorbilidades y los hallazgos urinarios que la DAG 1 no usa.
-
-1.  **Factores de riesgo basales.** `age` es la única raíz clínica: con la edad aumentan la probabilidad de hipertensión (`htn`), diabetes (`dm`) y enfermedad coronaria (`cad`), y cae el filtrado glomerular por sí sola.
-
-2.  **Las dos grandes causas de ERC.** `htn` y `dm` son, en ese orden, las etiologías más frecuentes de enfermedad renal crónica.
-
-3.  **Distinción diagnóstico / medición.** `htn` es el *diagnóstico previo* de hipertensión y `bp` la *presión medida en consulta*; por eso `htn → bp` y no al revés. `bp` recibe también flecha de `classification`, porque el riñón enfermo retiene sodio y eleva la presión: así se captura la retroalimentación que en la DAG 1 tuvo que omitirse, **sin generar ciclo**.
-
-4.  **Manifestaciones renales.** La ERC produce simultáneamente proteinuria (`al`), pérdida de concentración urinaria (`sg`), retención de creatinina (`sc`), hematuria (`rbc`) y anemia (`hemo`).
-
-5.  **Cascada de la caída del filtrado.** `sc` es el marcador del filtrado perdido, y de él dependen la urea (`bu`) y los electrolitos (`sod`, `pot`). Esto corrige la deuda de la DAG 1: aquí los electrolitos y la anemia **no dependen uno del otro**, dependen de la causa que comparten.
-
-6.  **Anemia renal.** `hemo` gobierna `pcv` y `rc` porque las tres miden la misma masa eritrocitaria, y define la etiqueta clínica `ane`.
-
-7.  **Síndrome urémico y edema.** La urea alta y la anemia producen anorexia (`appet`); la pérdida de albúmina y la retención de sodio producen edema (`pe`).
-
-8.  **Vía infecciosa independiente.** `ba → pc`, `pcc` y de ahí la leucocitosis (`wc`), que recibe además el efecto inflamatorio de la propia ERC. Es un subgrafo que no pasa por el eje renal.
-
-```{r}
-arcos_dag2 <- tribble(
-  ~from,             ~to,
-  # 1. Factores de riesgo basales
-  "age",             "htn",
-  "age",             "dm",
-  "age",             "cad",
-  "age",             "sc",
-  "age",             "classification",
-  # 2. Hipertensión y diabetes: las dos causas principales de ERC
-  "htn",             "classification",
-  "htn",             "bp",
-  "htn",             "cad",
-  "dm",              "classification",
-  "dm",              "bgr",
-  "dm",              "cad",
-  "bgr",             "su",              # glucosuria al rebasar el umbral renal
-  # 3-4. La ERC como causa latente de sus manifestaciones
-  "classification",  "bp",              # retención de sodio -> hipertensión secundaria
-  "classification",  "al",
-  "classification",  "sg",
-  "classification",  "sc",
-  "classification",  "rbc",
-  "classification",  "hemo",
-  "classification",  "wc",
-  # 5. Caída del filtrado -> acumulación de solutos
-  "sc",              "bu",
-  "sc",              "sod",
-  "sc",              "pot",
-  # 6. Anemia renal: hemo gobierna las otras dos mediciones de masa eritrocitaria
-  "hemo",            "pcv",
-  "hemo",            "rc",
-  "hemo",            "ane",
-  # 7. Síndrome urémico y edema
-  "bu",              "appet",
-  "ane",             "appet",
-  "al",              "pe",
-  "sod",             "pe",
-  # 8. Vía infecciosa, independiente del eje renal
-  "ba",              "pc",
-  "ba",              "pcc",
-  "pc",              "wc"
-) |> as.data.frame()
-
-DAG_2 <- construir_dag(arcos_dag2, "DAG 2 (fisiopatológica ampliada)")
-
-cat("Variables del crudo sin representar:",
-    paste(setdiff(names(crudo), bnlearn::nodes(DAG_2)), collapse = ", "), "(ninguna)\n")
-cat("Nodos sin columna en el crudo:      ",
-    paste(setdiff(bnlearn::nodes(DAG_2), names(crudo)), collapse = ", "), "(ninguno)\n")
-```
-
-```{r}
-#| fig-width: 13
-#| fig-height: 9
-
-graficar_dag(arcos_dag2,
-             "DAG 2 - Modelo fisiopatológico ampliado (25 variables)",
-             cex_nodo = 0.7)
-```
-
-**Observaciones de la DAG 2:**
-
--   Es **más ancha y menos profunda** que la DAG 1: en vez de una cadena de nueve eslabones, hay un nodo central (`classification`) del que se abren las manifestaciones en paralelo. Estructuralmente es una red *tipo naive-Bayes extendida*.
-
--   Con `classification` como padre, cada hallazgo aporta evidencia **directa** al diagnóstico durante la inferencia, en lugar de propagarse por ocho etapas.
-
--   El subgrafo infeccioso (`ba → pc`,`pcc` → `wc`) queda **casi desconectado** del eje renal. Es correcto: una infección urinaria puede existir sin ERC, y esa independencia es información útil para el modelo.
-
--   Costo: al mezclar variables discretas y continuas, **esta DAG no puede ajustarse tal cual con `bn.fit()` como red gaussiana**. Además `classification` (discreta) tendría padres continuos, algo que una red gaussiana condicional tampoco admite. Sirve como modelo conceptual y como fuente de restricciones.
-
-## 5. DAG 3 --- Modelo parsimonioso sobre el eje renal
-
-Tercera propuesta, bajo un criterio distinto: **incluir únicamente los arcos sobre los que existe consenso fisiológico fuerte**, y descartar toda relación discutible. Opera sobre las mismas 14 variables de la DAG 1, para que ambas sean directamente comparables.
-
-El principio organizador es que **`sc` (creatinina) es el eje del modelo**, porque es el mejor marcador indirecto del filtrado glomerular. Casi todo lo demás que ocurre en la ERC es consecuencia de esa pérdida de filtrado:
-
--   **Aguas arriba de `sc`** (lo que daña al riñón): la edad, la presión arterial y la glucemia, estas dos últimas actuando a través de la proteinuria (`al`), que además acelera por sí misma la progresión del daño.
--   **Aguas abajo de `sc`** (consecuencias de la pérdida de filtrado): urea (`bu`), electrolitos (`sod`, `pot`), pérdida de concentración urinaria (`sg`), anemia (`hemo` → `pcv`, `rc`) e inflamación (`wc`).
--   **El diagnóstico** recibe solo dos padres, `sc` y `al`, que son exactamente los **dos criterios con los que se define y estadifica la ERC** en la práctica clínica: filtrado glomerular y albuminuria.
-
-Arcos deliberadamente **excluidos** por discutibles: `age → sg`, `age → bgr`, `bp → sc` directa (se prefiere la vía por `al`) y cualquier relación entre electrolitos y anemia.
-
-```{r}
-arcos_dag3 <- tribble(
-  ~from,   ~to,
-  # Aguas arriba: lo que daña al riñón
-  "age",   "bp",              # rigidez arterial con la edad
-  "age",   "sc",              # descenso fisiológico del filtrado
-  "bp",    "al",              # daño glomerular hipertensivo -> proteinuria
-  "bgr",   "al",              # nefropatía diabética -> proteinuria
-  "al",    "sc",              # la proteinuria acelera la pérdida de filtrado
-  # Aguas abajo: consecuencias de la caída del filtrado
-  "sc",    "sg",              # isostenuria: se pierde la concentración urinaria
-  "sc",    "bu",
-  "sc",    "sod",
-  "sc",    "pot",
-  "sc",    "hemo",            # déficit de eritropoyetina
-  "sc",    "wc",              # inflamación crónica urémica
-  "hemo",  "pcv",
-  "hemo",  "rc",
-  # Diagnóstico: los dos criterios clínicos de la ERC
-  "sc",    "classification",
-  "al",    "classification"
-) |> as.data.frame()
-
-DAG_3 <- construir_dag(arcos_dag3, "DAG 3 (parsimoniosa)")
-```
-
-```{r}
-#| fig-width: 12
-#| fig-height: 7
-
-graficar_dag(arcos_dag3,
-             "DAG 3 - Modelo parsimonioso centrado en el filtrado glomerular")
-```
-
-**Observaciones de la DAG 3:**
-
--   `sc` concentra la mayoría de los hijos: es un cuello de botella deliberado. Toda la información sobre el estado renal pasa por un solo nodo, lo que hace la red fácil de interpretar y barata de estimar.
-
--   Las consecuencias del daño renal se declaran **paralelas entre sí**, no secuenciales. Es la diferencia conceptual de fondo con la propuesta del experto.
-
--   Al tener menos arcos es la estructura **menos propensa a sobreajuste** con 400 observaciones, pero también la que más riesgo tiene de omitir dependencias reales.
-
-## 6. Comparación estructural de las tres propuestas
-
-```{r}
-comparacion <- bind_rows(
-  resumen_dag(DAG_1, "DAG 1 — cascada del experto"),
-  resumen_dag(DAG_2, "DAG 2 — ampliada (25 vars)"),
-  resumen_dag(DAG_3, "DAG 3 — parsimoniosa")
-) |>
-  mutate(obs_por_parametro = round(nrow(crudo) / parametros, 1))
 
 comparacion
 ```
 
-### Arcos compartidos, exclusivos e invertidos (DAG 1 vs DAG 3)
-
-Ambas operan sobre las mismas 14 variables, así que la comparación arco por arco es directa. `bnlearn::compare()` la resume, y `shd()` mide la distancia estructural entre las dos propuestas.
+Arcos que las propuestas de 9º semestre comparten con la de 5º semestre:
 
 ```{r}
-cmp <- compare(DAG_1, DAG_3, arcs = FALSE)
-cat("Arcos en ambas (tp):        ", cmp$tp, "\n")
-cat("Solo en la DAG 3 (fp):      ", cmp$fp, "\n")
-cat("Solo en la DAG 1 (fn):      ", cmp$fn, "\n")
-cat("Distancia estructural (SHD):", shd(DAG_1, DAG_3), "\n")
+compare(dag1, dag2)
+compare(dag1, dag3)
 ```
+
+Distancia estructural entre las tres:
 
 ```{r}
-a1 <- as_tibble(arcs(DAG_1))
-a3 <- as_tibble(arcs(DAG_3))
-
-# Idénticos: mismos nodos y misma dirección
-identicos <- inner_join(a1, a3, by = c("from", "to"))
-
-# Invertidos: la misma relación, con la flecha al revés
-invertidos <- inner_join(a1, a3, by = c("from" = "to", "to" = "from")) |>
-  transmute(en_dag1 = paste(from, "->", to),
-            en_dag3 = paste(to, "->", from))
-
-cat("Arcos idénticos:", nrow(identicos), "\n")
-print(identicos)
-cat("\nMisma relación, dirección opuesta:", nrow(invertidos), "\n")
-print(invertidos)
-cat("\nExclusivos de la DAG 1:", nrow(anti_join(a1, a3, by = c("from", "to"))), "\n")
-print(anti_join(a1, a3, by = c("from", "to")))
-cat("\nExclusivos de la DAG 3:", nrow(anti_join(a3, a1, by = c("from", "to"))), "\n")
-print(anti_join(a3, a1, by = c("from", "to")))
+c(dag1_dag2 = shd(dag1, dag2),
+  dag1_dag3 = shd(dag1, dag3),
+  dag2_dag3 = shd(dag2, dag3))
 ```
 
-En verde, los arcos en los que ambas propuestas coinciden:
+Las tres coinciden en la parte inicial de la cascada y se separan en cómo llega el daño a la anemia. La DAG 1 la hace depender de los electrolitos; las DAG 2 y 3 la hacen depender directamente de la creatinina.
 
-```{r}
-#| fig-width: 13
-#| fig-height: 6
+## Resumen de las consultas
 
-graficar_dag(arcos_dag1, "DAG 1 - cascada del experto",
-             arcos_verdes = as.data.frame(identicos))
-```
+| \# | Persona | Consulta |
+|----|----|----|
+| 1 | 5º semestre | P(creatinina \> 3 \| presión ≥ 90) |
+| 2 | 5º semestre | E\[hematocrito \| hemoglobina \< 10\] |
+| 3 | 9º semestre (A) | E\[hemoglobina \| creatinina \> 5\] |
+| 4 | 9º semestre (A) | P(potasio \> 5.5 \| urea \> 100) |
+| 5 | 9º semestre (B) | E\[albúmina \| glucosa \< 140\] vs E\[albúmina \| glucosa \> 200\] |
+| 6 | 9º semestre (B) | P(creatinina \> 3 \| diabetes) |
 
-```{r}
-#| fig-width: 12
-#| fig-height: 7
-
-graficar_dag(arcos_dag3, "DAG 3 - parsimoniosa",
-             arcos_verdes = as.data.frame(identicos))
-```
-
-### Consecuencias probabilísticas de elegir una u otra estructura
-
-La estructura no es un dibujo: determina **qué variables se vuelven irrelevantes** una vez observadas otras.
-
--   El **manto de Markov** (`mb`) de una variable son los nodos que la vuelven independiente de todo lo demás. Al predecir el diagnóstico, solo ese conjunto aporta información.
--   La **d-separación** (`dsep`) dice si dos variables quedan desconectadas al condicionar sobre un tercer conjunto.
-
-```{r}
-for (nm in c("DAG 1", "DAG 2", "DAG 3")) {
-  dag <- switch(nm, "DAG 1" = DAG_1, "DAG 2" = DAG_2, "DAG 3" = DAG_3)
-  manto <- sort(mb(dag, "classification"))
-  cat(sprintf("%s: manto de Markov de 'classification' = %d variables -> %s\n",
-              nm, length(manto), paste(manto, collapse = ", ")))
-}
-```
-
-```{r}
-preguntas <- tribble(
-  ~X,      ~Y,                ~Z,
-  "bp",    "classification",  "sc",
-  "age",   "hemo",            "sc",
-  "bgr",   "bu",              "sc",
-  "hemo",  "pot",             "sc"
-)
-
-preguntas |>
-  rowwise() |>
-  mutate(
-    `DAG 1` = if (dsep(DAG_1, X, Y, Z)) "independientes" else "dependientes",
-    `DAG 2` = if (dsep(DAG_2, X, Y, Z)) "independientes" else "dependientes",
-    `DAG 3` = if (dsep(DAG_3, X, Y, Z)) "independientes" else "dependientes"
-  ) |>
-  ungroup() |>
-  rename(`condicionado a` = Z)
-```
-
-**Observaciones de la comparación:**
-
--   Las DAG 1 y 3 coinciden en varios arcos y discrepan en la dirección de uno solo: `sg` ↔ `sc`. El experto lo orienta `sg → sc` (la pérdida de concentración urinaria precede a la retención de creatinina); la DAG 3 lo orienta `sc → sg` (ambas son consecuencia de la caída del filtrado, y la creatinina es el marcador más temprano y confiable). Es la discrepancia más concreta y la más fácil de llevar de vuelta al experto.
-
--   El manto de Markov de `classification` es la diferencia más práctica entre las propuestas. En la **DAG 1** el diagnóstico depende de un vecindario mínimo, porque cuelga al final de la cascada; en la **DAG 2** y la **DAG 3** recibe evidencia de varios marcadores a la vez.
-
--   `hemo` y `pot`: la **DAG 1** las declara dependientes incluso conociendo `sc` (por la cadena `sod`;`pot` → `hemo`), mientras que la **DAG 3** las vuelve independientes al condicionar sobre la creatinina. Es exactamente la deuda estructural que dejó la omisión del ciclo, y es una **hipótesis contrastable con los datos**.
-
-## 7. Verificación rápida sobre los datos imputados
-
-Comparación exploratoria de las dos estructuras ajustables como red gaussiana. Se retira `classification` (no está en el dataset imputado y es discreta) y se puntúan ambas con BIC gaussiano sobre las 13 variables continuas.
-
-El ajuste formal corresponde al siguiente notebook; esto solo indica cuál estructura describe mejor los datos antes de invertir esfuerzo en ella.
-
-```{r}
-quitar_diagnostico <- function(dag) {
-  a <- as.data.frame(arcs(dag))
-  a <- a[a$from != "classification" & a$to != "classification", ]
-  construir_dag(a, "  sin classification")
-}
-
-DAG_1_cont <- quitar_diagnostico(DAG_1)
-DAG_3_cont <- quitar_diagnostico(DAG_3)
-
-datos <- as.data.frame(imputado)
-
-puntajes <- tibble(
-  DAG     = c("DAG 1 — cascada del experto", "DAG 3 — parsimoniosa"),
-  arcos   = c(narcs(DAG_1_cont), narcs(DAG_3_cont)),
-  loglik  = c(bnlearn::score(DAG_1_cont, datos, type = "loglik-g"),
-              bnlearn::score(DAG_3_cont, datos, type = "loglik-g")),
-  BIC     = c(bnlearn::score(DAG_1_cont, datos, type = "bic-g"),
-              bnlearn::score(DAG_3_cont, datos, type = "bic-g")),
-  AIC     = c(bnlearn::score(DAG_1_cont, datos, type = "aic-g"),
-              bnlearn::score(DAG_3_cont, datos, type = "aic-g"))
-) |>
-  mutate(across(c(loglik, BIC, AIC), \(x) round(x, 1)))
-
-puntajes
-```
-
-```{r}
-# Fuerza de cada arco de la DAG 1: cuánto empeora el BIC al quitarlo.
-#   Valores cercanos a 0 señalan arcos que los datos no sostienen.
-arc.strength(DAG_1_cont, data = datos, criterion = "bic-g") |>
-  as_tibble() |>
-  arrange(desc(strength)) |>
-  head(10)
-```
-
-**Cómo se leen estos números.** En `bnlearn` el BIC está definido de modo que **más alto es mejor** (es la log-verosimilitud menos la penalización por complejidad, no la fórmula clásica que se minimiza). Y `arc.strength` con criterio de score devuelve el **cambio de BIC al quitar el arco**: negativo significa que quitarlo empeora el ajuste, es decir que **los datos sostienen ese arco**; positivo significa que la red mejora sin él.
-
-**Observaciones del ajuste exploratorio:**
-
--   La **DAG 3 obtiene mejor BIC que la DAG 1** (≈ −16451 frente a ≈ −16620) con siete arcos menos. La log-verosimilitud también favorece a la DAG 3, así que la ventaja no viene solo de la penalización por complejidad: la cascada secuencial del experto está pagando arcos que los datos no respaldan.
-
--   El punto donde más pierde la DAG 1 son precisamente los arcos que heredó al romper el ciclo: `bu → sod`, `pot → rc` y `pot → hemo` están entre los que más peso cargan, y son los que representan la relación electrolito → anemia que clínicamente no es causal, sino producto de una causa común.
-
--   `sc → pot` es el **único arco de la DAG 1 con fuerza positiva**: la red mejoraría ligeramente sin él. Todos los demás son negativos, es decir que los datos los sostienen.
-
--   Esto **no descalifica la propuesta del experto**. Un mejor BIC solo dice que la DAG 3 describe mejor las correlaciones de estas 400 filas; el criterio clínico sigue siendo el que decide qué arcos son admisibles. Lo que sí aporta es evidencia concreta para volver a discutir con el experto la etapa `sod`;`pot` → `rc`;`hemo`.
-
-## 8. Exportación de las estructuras
-
-Las tres DAGs se guardan en un único JSON para que el notebook de modelado las cargue sin volver a declararlas.
-
-```{r}
-a_lista <- function(dag, nombre, descripcion, apta_gaussiana, omitidos = NULL) {
-  a <- as.data.frame(arcs(dag))
-  list(
-    nombre = nombre,
-    descripcion = descripcion,
-    variables = sort(bnlearn::nodes(dag)),
-    arcos = unname(split(as.matrix(a), row(as.matrix(a)))),
-    arcos_omitidos_por_ciclo = if (is.null(omitidos)) list() else
-      unname(split(as.matrix(omitidos), row(as.matrix(omitidos)))),
-    apta_red_gaussiana = apta_gaussiana
-  )
-}
-
-estructuras <- list(
-  dag_1_experto = a_lista(
-    DAG_1, "Cascada fisiopatológica del experto",
-    paste("Cadena secuencial dictada por el experto clínico. Omite la",
-          "retroalimentación sod/pot -> bp por cerrar un ciclo."),
-    TRUE, RETROALIMENTACION),
-  dag_2_ampliada = a_lista(
-    DAG_2, "Modelo fisiopatológico ampliado",
-    paste("Convención diagnóstica clásica (enfermedad -> signo) sobre las 25",
-          "variables, incluidas comorbilidades y hallazgos urinarios."),
-    FALSE),
-  dag_3_parsimoniosa = a_lista(
-    DAG_3, "Modelo parsimonioso sobre el eje renal",
-    paste("Solo arcos con consenso fisiológico fuerte, centrados en la",
-          "creatinina como marcador del filtrado glomerular."),
-    TRUE)
-)
-
-destino <- file.path(RAIZ, "data", "dags", "dags_expertos.json")
-dir.create(dirname(destino), recursive = TRUE, showWarnings = FALSE)
-write_json(estructuras, destino, pretty = TRUE, auto_unbox = TRUE)
-
-cat("Guardado en: data/dags/dags_expertos.json\n")
-for (k in names(estructuras)) {
-  cat(sprintf("  %-20s %2d variables, %2d arcos\n", k,
-              length(estructuras[[k]]$variables),
-              length(estructuras[[k]]$arcos)))
-}
-```
-
-```{r}
-# Reconstrucción desde el archivo: confirma que lo exportado se puede volver a usar
-recuperado <- fromJSON(destino, simplifyVector = FALSE)
-
-for (k in names(recuperado)) {
-  a <- do.call(rbind, lapply(recuperado[[k]]$arcos,
-                             \(p) data.frame(from = p[[1]], to = p[[2]])))
-  dag <- empty.graph(nodes = unlist(recuperado[[k]]$variables))
-  arcs(dag) <- as.matrix(a)
-  cat(sprintf("%-20s reconstruida (%d nodos, %d arcos, acíclica: %s)\n",
-              k, length(bnlearn::nodes(dag)), narcs(dag), acyclic(dag)))
-}
-```
-
-## 9. Resumen
-
-| DAG | Origen | Variables | Idea central | Uso previsto |
-|---------|-----------|---------|-------------------------|-------------------|
-| **1** | Dictada por el experto clínico | 14 | La ERC es una **cascada secuencial**: cada etapa del daño produce la siguiente | Estructura fija para la Red Bayesiana Gaussiana |
-| **2** | Fisiopatología clásica de la ERC | 25 | La ERC es una **causa latente** cuyos signos se manifiestan en paralelo | Modelo conceptual y fuente de restricciones |
-| **3** | Criterio de consenso mínimo | 14 | El **filtrado glomerular (`sc`) es el eje**; todo lo demás cuelga de él | Referencia parsimoniosa para comparar |
-
-**Decisiones de modelado documentadas**
-
-1.  **Ciclo roto en la DAG 1.** El experto describió que la acumulación de electrolitos vuelve a elevar la presión arterial. Se omitieron los arcos `sod → bp` y `pot → bp` --- `bnlearn` rechaza la estructura con ellos ---, se conservan registrados en el JSON exportado y dibujados en rojo. La DAG 2 recupera el mecanismo sin ciclo por la vía `classification → bp`.
-
-2.  **`bgr` incorporado por vía independiente.** La glucemia entra directamente sobre `al` y `sg`, no a través de `bp`: la nefropatía diabética daña el glomérulo por un mecanismo propio.
-
-3.  **Dirección de `classification`.** La DAG 1 la trata como hoja (etiqueta acumulada); la DAG 2 y la 3 le dan padres clínicos. Es la discrepancia estructural de fondo entre las propuestas.
-
-4.  **La DAG 3 ajusta mejor los datos que la DAG 1** (BIC ≈ −16451 vs. −16620) con siete arcos menos, y los arcos que más penalizan a la DAG 1 son los que heredó al romper el ciclo. Es un argumento para revisar con el experto la etapa `sod`;`pot` → `rc`;`hemo`, no para descartar su propuesta.
-
-**Siguientes pasos**
-
-1.  Ajustar la Red Bayesiana Gaussiana con `bn.fit()` sobre `ckd_imputado.csv` usando las DAG 1 y 3.
-2.  Comparar ambos ajustes por BIC y validación cruzada (`bn.cv`).
-3.  Contrastar las estructuras de expertos contra la que aprenda `hc()` o `pc.stable()`, usando el JSON exportado como `whitelist` / `blacklist`.
-
-**Dudas al profesor:**
-
-1.  ¿`classification` debe ir como hoja al final de la cascada (DAG 1) o como causa latente de los hallazgos (DAG 2 y 3)? Cambia por completo el manto de Markov del diagnóstico.
-
-2.  Al romper el ciclo `sod`;`pot → bp`, ¿es preferible omitir el arco, o desdoblar `bp` en dos nodos temporales aunque el dataset tenga una sola columna?
-
-3.  ¿Se ajusta la red sobre todos los registros o solo sobre los pacientes con `classification = ckd`?
+En el siguiente notebook se ajusta una GBN para cada DAG y se responden estas consultas con la mejor estructura.
