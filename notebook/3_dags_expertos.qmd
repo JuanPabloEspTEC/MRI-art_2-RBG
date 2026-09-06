@@ -1,0 +1,204 @@
+---
+title: "DAGs propuestas por especialistas"
+format:
+    html:
+        toc: true
+        html-math-method: katex
+        embed-resources: true
+        self-contained-math: true
+        df-print: kable
+editor: visual
+---
+
+## Entrevistas
+
+Se visitó la Escuela de Medicina del campus y se entrevistó a tres personas que conocen sobre la Enfermedad Renal Crónica (ERC). Cada una propuso una estructura de dependencias entre las variables del dataset y dos consultas que le interesaría resolver con el modelo.
+
+| Persona entrevistada                  | Estructura |
+|---------------------------------------|------------|
+| Estudiante de 5º semestre de Medicina | DAG 1      |
+| Estudiante de 9º semestre de Medicina | DAG 2      |
+| Estudiante de 9º semestre de Medicina | DAG 3      |
+
+```{r}
+library(bnlearn)
+```
+
+```{r}
+data = read.csv("./data/processed/ckd_imputado.csv")
+head(data)
+```
+
+Se trabaja con las 13 variables continuas que salieron del notebook de imputación. El diagnóstico (`classification`) no entra a las estructuras porque una red gaussiana solo admite variables continuas; en el siguiente notebook se discute cómo incorporarlo.
+
+| Variable | Significado       |
+|----------|-------------------|
+| `age`    | Edad              |
+| `bp`     | Presión arterial  |
+| `sg`     | Densidad urinaria |
+| `al`     | Albúmina en orina |
+| `bgr`    | Glucosa en sangre |
+| `bu`     | Urea en sangre    |
+| `sc`     | Creatinina sérica |
+| `sod`    | Sodio sérico      |
+| `pot`    | Potasio sérico    |
+| `hemo`   | Hemoglobina       |
+| `pcv`    | Hematocrito       |
+| `wc`     | Leucocitos        |
+| `rc`     | Eritrocitos       |
+
+```{r}
+nodos = names(data)
+nodos
+```
+
+## DAG 1
+
+Propuesta del estudiante de 5º semestre. Describe la ERC como una cascada: la edad y la glucosa inician el daño, la presión arterial arranca la fisiopatología, y de ahí el deterioro avanza etapa por etapa hasta la anemia y la inflamación.
+
+$$\texttt{age};\texttt{bgr} \rightarrow \texttt{bp} \rightarrow \texttt{al};\texttt{sg} \rightarrow \texttt{bu};\texttt{sc} \rightarrow \texttt{sod};\texttt{pot} \rightarrow \texttt{rc};\texttt{hemo} \rightarrow \texttt{pcv} \rightarrow \texttt{wc}$$
+
+```{r}
+dag1 = empty.graph(nodes = nodos)
+
+arc_set1 = matrix(c("age","bp",
+                    "bgr","al", "bgr","sg",
+                    "bp","al", "bp","sg",
+                    "al","bu", "al","sc", "sg","bu", "sg","sc",
+                    "bu","sod", "bu","pot", "sc","sod", "sc","pot",
+                    "sod","rc", "sod","hemo", "pot","rc", "pot","hemo",
+                    "rc","pcv", "hemo","pcv",
+                    "pcv","wc"),
+                  byrow = TRUE, ncol = 2, dimnames = list(NULL, c("from", "to")))
+
+arcs(dag1) = arc_set1
+dag1
+```
+
+```{r}
+#| fig-width: 11
+#| fig-height: 5
+
+graphviz.plot(dag1, shape = "ellipse")
+```
+
+El estudiante también señaló que la acumulación de sodio y potasio vuelve a subir la presión arterial. Esa flecha cierra un ciclo y `bnlearn` no la acepta:
+
+```{r}
+ciclico = empty.graph(nodes = nodos)
+tryCatch(arcs(ciclico) <- rbind(arc_set1, c("sod", "bp"), c("pot", "bp")),
+         error = function(e) conditionMessage(e))
+```
+
+Se omite esa retroalimentación y la cascada continúa hacia la anemia.
+
+Consultas propuestas:
+
+1.  ¿Qué tan probable es que un paciente con presión arterial elevada tenga la creatinina alta?
+2.  Si un paciente llega con hemoglobina baja, ¿qué hematocrito se espera?
+
+## DAG 2
+
+Propuesta del primer estudiante de 9º semestre. Mantiene la forma de cascada, pero separa la edad como origen de las dos causas principales de ERC, y hace colgar la anemia directamente de los marcadores de filtrado (`sc` y `bu`) en lugar de los electrolitos, porque la eritropoyetina la produce el riñón dañado.
+
+```{r}
+dag2 = empty.graph(nodes = nodos)
+
+arc_set2 = matrix(c("age","bp", "age","bgr",
+                    "bp","al", "bp","sg", "bgr","al", "bgr","sg",
+                    "al","sc", "al","bu", "sg","sc", "sg","bu",
+                    "sc","sod", "sc","pot", "sc","hemo",
+                    "bu","sod", "bu","pot", "bu","hemo",
+                    "hemo","pcv", "hemo","rc",
+                    "sc","wc"),
+                  byrow = TRUE, ncol = 2, dimnames = list(NULL, c("from", "to")))
+
+arcs(dag2) = arc_set2
+dag2
+```
+
+```{r}
+#| fig-width: 11
+#| fig-height: 5
+
+graphviz.plot(dag2, shape = "ellipse")
+```
+
+Consultas propuestas:
+
+3.  En un paciente con daño renal avanzado, ¿cuánta hemoglobina se espera?
+4.  ¿Qué tan probable es la hiperkalemia en un paciente con urea elevada?
+
+## DAG 3
+
+Propuesta del segundo estudiante de 9º semestre. Separa las dos vías de daño: la diabetes actúa sobre el glomérulo produciendo albuminuria, y la hipertensión sobre el túbulo produciendo pérdida de concentración urinaria. Las dos vías convergen en los marcadores de filtrado. Añade además el descenso del filtrado por edad.
+
+```{r}
+dag3 = empty.graph(nodes = nodos)
+
+arc_set3 = matrix(c("age","bp", "age","bgr", "age","sc",
+                    "bgr","al", "bp","sg",
+                    "al","sc", "al","bu", "sg","sc", "sg","bu",
+                    "sc","sod", "sc","pot", "sc","hemo",
+                    "bu","sod", "bu","pot",
+                    "hemo","pcv", "hemo","rc",
+                    "sc","wc"),
+                  byrow = TRUE, ncol = 2, dimnames = list(NULL, c("from", "to")))
+
+arcs(dag3) = arc_set3
+dag3
+```
+
+```{r}
+#| fig-width: 11
+#| fig-height: 5
+
+graphviz.plot(dag3, shape = "ellipse")
+```
+
+Consultas propuestas:
+
+5.  ¿Cómo cambia la albuminuria esperada entre un paciente con glucosa normal y uno con hiperglucemia?
+6.  ¿Qué tan probable es que un paciente diabético tenga la creatinina alta?
+
+## Comparación de las estructuras
+
+```{r}
+comparacion = data.frame(
+  DAG = c("DAG 1", "DAG 2", "DAG 3"),
+  arcos = c(narcs(dag1), narcs(dag2), narcs(dag3)),
+  aciclica = c(acyclic(dag1), acyclic(dag2), acyclic(dag3))
+)
+
+comparacion
+```
+
+Arcos que las propuestas de 9º semestre comparten con la de 5º semestre:
+
+```{r}
+compare(dag1, dag2)
+compare(dag1, dag3)
+```
+
+Distancia estructural entre las tres:
+
+```{r}
+c(dag1_dag2 = shd(dag1, dag2),
+  dag1_dag3 = shd(dag1, dag3),
+  dag2_dag3 = shd(dag2, dag3))
+```
+
+Las tres coinciden en la parte inicial de la cascada y se separan en cómo llega el daño a la anemia. La DAG 1 la hace depender de los electrolitos; las DAG 2 y 3 la hacen depender directamente de la creatinina.
+
+## Resumen de las consultas
+
+| \# | Persona | Consulta |
+|------------------------|------------------------|------------------------|
+| 1 | 5º semestre | P(creatinina \> 3 \| presión ≥ 90) |
+| 2 | 5º semestre | E\[hematocrito \| hemoglobina \< 10\] |
+| 3 | 9º semestre (A) | E\[hemoglobina \| creatinina \> 5\] |
+| 4 | 9º semestre (A) | P(potasio \> 5.5 \| urea \> 100) |
+| 5 | 9º semestre (B) | E\[albúmina \| glucosa \< 140\] vs E\[albúmina \| glucosa \> 200\] |
+| 6 | 9º semestre (B) | P(creatinina \> 3 \| diabetes) |
+
+En el siguiente notebook se ajusta una GBN para cada DAG y se responden estas consultas con la mejor estructura.
