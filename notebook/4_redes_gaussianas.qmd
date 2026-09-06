@@ -1,0 +1,250 @@
+---
+title: "Redes bayesianas gaussianas de las DAGs propuestas"
+format:
+    html:
+        toc: true
+        html-math-method: katex
+        embed-resources: true
+        self-contained-math: true
+        df-print: kable
+editor: visual
+---
+
+## Datos y estructuras
+
+Se ajusta una red bayesiana gaussiana para cada una de las tres DAGs propuestas por las personas entrevistadas, se comparan por BIC y AIC, y con la mejor se responden sus consultas.
+
+```{r}
+library(bnlearn)
+```
+
+```{r}
+data = read.csv("./data/processed/ckd_imputado.csv")
+nodos = names(data)
+```
+
+```{r}
+dag1 = empty.graph(nodes = nodos)
+arcs(dag1) = matrix(c("age","bp",
+                      "bgr","al", "bgr","sg",
+                      "bp","al", "bp","sg",
+                      "al","bu", "al","sc", "sg","bu", "sg","sc",
+                      "bu","sod", "bu","pot", "sc","sod", "sc","pot",
+                      "sod","rc", "sod","hemo", "pot","rc", "pot","hemo",
+                      "rc","pcv", "hemo","pcv",
+                      "pcv","wc"),
+                    byrow = TRUE, ncol = 2, dimnames = list(NULL, c("from", "to")))
+
+dag2 = empty.graph(nodes = nodos)
+arcs(dag2) = matrix(c("age","bp", "age","bgr",
+                      "bp","al", "bp","sg", "bgr","al", "bgr","sg",
+                      "al","sc", "al","bu", "sg","sc", "sg","bu",
+                      "sc","sod", "sc","pot", "sc","hemo",
+                      "bu","sod", "bu","pot", "bu","hemo",
+                      "hemo","pcv", "hemo","rc",
+                      "sc","wc"),
+                    byrow = TRUE, ncol = 2, dimnames = list(NULL, c("from", "to")))
+
+dag3 = empty.graph(nodes = nodos)
+arcs(dag3) = matrix(c("age","bp", "age","bgr", "age","sc",
+                      "bgr","al", "bp","sg",
+                      "al","sc", "al","bu", "sg","sc", "sg","bu",
+                      "sc","sod", "sc","pot", "sc","hemo",
+                      "bu","sod", "bu","pot",
+                      "hemo","pcv", "hemo","rc",
+                      "sc","wc"),
+                    byrow = TRUE, ncol = 2, dimnames = list(NULL, c("from", "to")))
+```
+
+## Ajuste de las tres GBN
+
+En una red gaussiana cada nodo es una regresión lineal sobre sus padres, así que ajustarla es estimar un intercepto, un coeficiente por padre y la desviación estándar de los residuos.
+
+```{r}
+gbn1 = bn.fit(dag1, data = data, method = "mle-g")
+gbn2 = bn.fit(dag2, data = data, method = "mle-g")
+gbn3 = bn.fit(dag3, data = data, method = "mle-g")
+```
+
+Así queda uno de los nodos:
+
+```{r}
+gbn2$sc
+```
+
+```{r}
+gbn2$hemo
+```
+
+## BIC y AIC
+
+```{r}
+puntajes = data.frame(
+  DAG = c("DAG 1 (5º sem)", "DAG 2 (9º sem A)", "DAG 3 (9º sem B)"),
+  arcos = c(narcs(dag1), narcs(dag2), narcs(dag3)),
+  BIC = c(score(dag1, data, type = "bic-g"),
+          score(dag2, data, type = "bic-g"),
+          score(dag3, data, type = "bic-g")),
+  AIC = c(score(dag1, data, type = "aic-g"),
+          score(dag2, data, type = "aic-g"),
+          score(dag3, data, type = "aic-g"))
+)
+
+puntajes
+```
+
+En `bnlearn` estos puntajes son más altos cuando el ajuste es mejor. Las dos medidas coinciden en el orden: la **DAG 2** es la mejor de las tres, seguida de la DAG 3 y al final la DAG 1.
+
+La diferencia está en dónde cuelga la anemia. La DAG 1 la hace depender del sodio y el potasio, y las otras dos la hacen depender de la creatinina y la urea. Los datos favorecen la segunda opción.
+
+```{r}
+arc.strength(dag1, data = data, criterion = "bic-g")
+```
+
+El único arco con fuerza positiva es `sc -> pot`: la DAG 1 mejoraría si se quitara. Los demás son negativos, o sea que los datos los sostienen.
+
+## Cómo incluir variables categóricas
+
+El dataset tiene variables categóricas de interés que quedaron fuera, como el indicador de diabetes (`dm`) o el propio diagnóstico. Hay tres caminos.
+
+**1. Red gaussiana condicional.** `bnlearn` admite redes mixtas con `method = "mle-cg"`. La restricción es que **un nodo discreto no puede tener padres continuos**. La diabetes cumple esa condición sin problema, porque clínicamente va antes que la glucosa:
+
+```{r}
+crudo = read.csv("../data/raw/ckd.csv")
+
+dm = trimws(tolower(crudo$dm))
+dm[dm == "" | dm == "?"] = NA
+
+mixto = data
+mixto$dm = factor(dm)
+mixto = mixto[!is.na(mixto$dm), ]
+
+table(mixto$dm)
+```
+
+```{r}
+dag_mixta = empty.graph(nodes = c("dm", nodos))
+arcs(dag_mixta) = rbind(arcs(dag2), c("dm", "bgr"))
+
+clgbn = bn.fit(dag_mixta, data = mixto, method = "mle-cg")
+clgbn$bgr
+```
+
+La glucosa queda con una media distinta según si el paciente es diabético o no, que es justo lo que se buscaba.
+
+Si en cambio se intenta poner la variable discreta al final de la cascada, como padre continuo, el ajuste falla:
+
+```{r}
+dag_mala = empty.graph(nodes = c("wc", "dm"))
+arcs(dag_mala) = matrix(c("wc", "dm"), ncol = 2, dimnames = list(NULL, c("from", "to")))
+
+tryCatch(bn.fit(dag_mala, mixto[, c("wc", "dm")], method = "mle-cg"),
+         error = function(e) conditionMessage(e))
+```
+
+Esto es importante porque la DAG 1 terminaba en `wc -> classification`. Con esa orientación el diagnóstico no puede entrar a la red; habría que invertir el arco y tratar el diagnóstico como causa de los hallazgos.
+
+**2. Discretizar todas las variables** y usar una red multinomial, como la del ejercicio de encuestas. Funciona con cualquier combinación de variables, pero se pierde información al agrupar en intervalos.
+
+```{r}
+disc = discretize(data, method = "interval", breaks = 3)
+mn = bn.fit(dag2, data = disc, method = "mle")
+mn$sc
+```
+
+**3. Codificar la categoría como 0 y 1** y tratarla como continua. Es la opción más fácil y la menos recomendable, porque le asigna una distancia numérica a algo que no la tiene y obliga a la variable a ser normal.
+
+La primera opción es la más adecuada para este caso: conserva las variables continuas como están y deja entrar las categóricas donde la clínica dice que van, al inicio de la cascada.
+
+## Respuesta a las consultas
+
+Se usan la DAG 2 y su red ajustada, que fue la mejor por BIC y AIC. Se agrega la frecuencia observada en los datos como referencia.
+
+```{r}
+set.seed(42)
+```
+
+Consulta 1. ¿Qué tan probable es que un paciente con presión arterial elevada tenga la creatinina alta?
+
+```{r}
+q1 = cpquery(gbn2, event = (sc > 3), evidence = (bp >= 90), n = 10^6)
+q1
+```
+
+Consulta 2. Si un paciente llega con hemoglobina baja, ¿qué hematocrito se espera?
+
+```{r}
+q2 = cpdist(gbn2, nodes = "pcv", evidence = (hemo < 10), n = 10^5)
+mean(q2$pcv)
+```
+
+Consulta 3. En un paciente con daño renal avanzado, ¿cuánta hemoglobina se espera?
+
+```{r}
+q3 = cpdist(gbn2, nodes = "hemo", evidence = (sc > 5), n = 10^5)
+mean(q3$hemo)
+```
+
+Consulta 4. ¿Qué tan probable es la hiperkalemia en un paciente con urea elevada?
+
+```{r}
+q4 = cpquery(gbn2, event = (pot > 5.5), evidence = (bu > 100), n = 10^6)
+q4
+```
+
+Consulta 5. ¿Cómo cambia la albuminuria esperada entre glucosa normal e hiperglucemia?
+
+```{r}
+q5a = cpdist(gbn2, nodes = "al", evidence = (bgr < 140), n = 10^5)
+q5b = cpdist(gbn2, nodes = "al", evidence = (bgr > 200), n = 10^5)
+c(glucosa_normal = mean(q5a$al), hiperglucemia = mean(q5b$al))
+```
+
+Consulta 6. ¿Qué tan probable es que un paciente diabético tenga la creatinina alta?
+
+Esta consulta **no se puede responder con la GBN**, porque la diabetes es una variable categórica y una red gaussiana solo admite variables continuas. Se responde con la red gaussiana condicional de la sección anterior:
+
+```{r}
+q6 = cpquery(clgbn, event = (sc > 3), evidence = (dm == "yes"), n = 10^6)
+q6
+```
+
+### Resumen
+
+```{r}
+respuestas = data.frame(
+  consulta = c("1. P(sc > 3 | bp >= 90)",
+               "2. E[pcv | hemo < 10]",
+               "3. E[hemo | sc > 5]",
+               "4. P(pot > 5.5 | bu > 100)",
+               "5a. E[al | bgr < 140]",
+               "5b. E[al | bgr > 200]",
+               "6. P(sc > 3 | dm = si)"),
+  red = round(c(q1, mean(q2$pcv), mean(q3$hemo), q4,
+                mean(q5a$al), mean(q5b$al), q6), 3),
+  observado = round(c(mean(data$sc[data$bp >= 90] > 3),
+                      mean(data$pcv[data$hemo < 10]),
+                      mean(data$hemo[data$sc > 5]),
+                      mean(data$pot[data$bu > 100] > 5.5),
+                      mean(data$al[data$bgr < 140]),
+                      mean(data$al[data$bgr > 200]),
+                      mean(mixto$sc[mixto$dm == "yes"] > 3)), 3),
+  n = c(sum(data$bp >= 90), sum(data$hemo < 10), sum(data$sc > 5),
+        sum(data$bu > 100), sum(data$bgr < 140), sum(data$bgr > 200),
+        sum(mixto$dm == "yes"))
+)
+
+respuestas
+```
+
+La red acierta el sentido de las seis consultas: la presión alta aumenta la probabilidad de creatinina elevada, el daño renal avanzado baja la hemoglobina, la hiperglucemia sube la albuminuria y los pacientes diabéticos tienen más riesgo de creatinina alta.
+
+Las magnitudes se alejan de lo observado en los casos extremos. En las consultas 1, 4 y 6 la red sobreestima la probabilidad, y en la 3 no alcanza a bajar la hemoglobina tanto como lo hace el dato. La razón es que varias de estas variables son muy asimétricas: la creatinina tiene media `r round(mean(data$sc), 2)` y mediana `r round(median(data$sc), 2)`, así que al obligarla a ser normal la red reparte demasiada masa en la cola alta. Conviene leer estos resultados como el sentido y el tamaño relativo del efecto, no como una probabilidad exacta para un paciente.
+
+## Conclusión
+
+Se ajustaron tres redes gaussianas, una por cada DAG propuesta. La DAG 2 resultó la mejor con las dos medidas, BIC y AIC, y fue la que se usó para responder las consultas.
+
+Las tres estructuras coinciden en la primera parte de la cascada y se separan en cómo llega el daño renal a la anemia. La propuesta del estudiante de 5º semestre la hace depender de los electrolitos, y las dos de 9º semestre la hacen depender directamente de los marcadores de filtrado. El ajuste favorece a estas últimas, lo que coincide con que la eritropoyetina la produce el riñón y no depende del sodio ni del potasio.
+
+Cinco de las seis consultas se respondieron con la red gaussiana. La sexta necesitó una red gaussiana condicional porque involucraba una variable categórica.
