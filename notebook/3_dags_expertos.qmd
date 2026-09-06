@@ -1,6 +1,5 @@
 ---
 title: "DAGs propuestas por especialistas"
-author: "Juan Pablo Venegas Padilla"
 format:
     html:
         toc: true
@@ -194,7 +193,7 @@ Las tres coinciden en la parte inicial de la cascada y se separan en cómo llega
 ## Resumen de las consultas
 
 | \# | Persona | Consulta |
-|----|----|----|
+|------------------------|------------------------|------------------------|
 | 1 | 5º semestre | P(creatinina \> 3 \| presión ≥ 90) |
 | 2 | 5º semestre | E\[hematocrito \| hemoglobina \< 10\] |
 | 3 | 9º semestre (A) | E\[hemoglobina \| creatinina \> 5\] |

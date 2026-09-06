@@ -1,6 +1,5 @@
 ---
 title: "Redes bayesianas gaussianas de las DAGs propuestas"
-author: "Juan Pablo Venegas Padilla"
 format:
     html:
         toc: true
